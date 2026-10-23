@@ -1,0 +1,208 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# ============================================================================
+# FOUNDATIONAL NETWORK FABRIC
+# ============================================================================
+resource "aws_vpc" "day4_vpc" {
+  cidr_block           = "10.40.0.0/16"
+  enable_dns_hostnames = true
+  tags                 = { Name = "day4-production-vpc" }
+}
+
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.day4_vpc.id
+  cidr_block              = "10.40.1.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "day4-public-subnet-a" }
+}
+
+# Added a secondary public subnet in a completely different zone to satisfy ALB requirements
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.day4_vpc.id
+  cidr_block              = "10.40.3.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "day4-public-subnet-b" }
+}
+
+resource "aws_subnet" "private_a" {
+  vpc_id            = aws_vpc.day4_vpc.id
+  cidr_block        = "10.40.2.0/24"
+  availability_zone = "us-east-1a"
+  tags              = { Name = "day4-private-subnet-a" }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.day4_vpc.id
+  tags   = { Name = "day4-igw" }
+}
+
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.day4_vpc.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+  tags = { Name = "day4-public-rt" }
+}
+
+resource "aws_route_table_association" "public_assoc_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table_association" "public_assoc_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.day4_vpc.id
+  tags   = { Name = "day4-private-rt" }
+}
+
+resource "aws_route_table_association" "private_assoc" {
+  subnet_id      = aws_subnet.private_a.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+
+# ============================================================================
+# SCENARIO D4-1: RUNAWAY COST & SCALE-OUT UNDER LOAD
+# ============================================================================
+resource "aws_instance" "runaway_cost_vm" {
+  ami           = "ami-0866a3c8686eaeeba" 
+  instance_type = "t3.medium"             
+  subnet_id     = aws_subnet.public_a.id
+  tags          = { Name = "vm-oversized-idle-01", Environment = "Staging" }
+}
+
+resource "aws_lb" "web_alb" {
+  name               = "day4-web-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id] # Fixed: Maps two distinct AZs (1a and 1b)
+}
+
+resource "aws_security_group" "alb_sg" {
+  name   = "day4-alb-sg"
+  vpc_id = aws_vpc.day4_vpc.id
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_lb_target_group" "web_tg" {
+  name     = "day4-web-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.day4_vpc.id
+}
+
+resource "aws_launch_template" "asg_template" {
+  name_prefix   = "day4-web-template-"
+  image_id      = "ami-0866a3c8686eaeeba"
+  instance_type = "t3.micro"
+}
+
+resource "aws_autoscaling_group" "web_asg" {
+  name                = "web-asg"
+  vpc_zone_identifier = [aws_subnet.public_a.id]
+  target_group_arns   = [aws_lb_target_group.web_tg.arn]
+  desired_capacity    = 2
+  max_size            = 4
+  min_size            = 2
+
+  launch_template {
+    id      = aws_launch_template.asg_template.id
+    version = "$Latest"
+  }
+}
+
+
+# ============================================================================
+# SCENARIO D4-2: CAN'T CONNECT + NO EGRESS NETWORKING TRIAGE
+# ============================================================================
+resource "aws_security_group" "broken_ssh_sg" {
+  name   = "day4-broken-ssh-sg"
+  vpc_id = aws_vpc.day4_vpc.id
+}
+
+resource "aws_instance" "locked_vm" {
+  ami                    = "ami-0866a3c8686eaeeba"
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.public_a.id
+  vpc_security_group_ids = [aws_security_group.broken_ssh_sg.id]
+  tags                   = { Name = "vm-ssh-locked-02" }
+}
+
+resource "aws_instance" "no_egress_vm" {
+  ami           = "ami-0866a3c8686eaeeba"
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.private_a.id
+  tags          = { Name = "vm-private-isolated-02" }
+}
+
+
+# ============================================================================
+# SCENARIO D4-3: ONLINE STORAGE VOLUME EXTENSION
+# ============================================================================
+resource "aws_instance" "storage_vm" {
+  ami           = "ami-0866a3c8686eaeeba"
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.public_a.id
+  tags          = { Name = "vm-storage-server-03" }
+}
+
+resource "aws_volume_attachment" "ebs_attach" {
+  device_name = "/dev/sdh" # Fixed: Shifted from /dev/sdb to an unassigned mount slot
+  volume_id   = aws_ebs_volume.data_vol.id
+  instance_id = aws_instance.storage_vm.id
+}
+
+resource "aws_ebs_volume" "data_vol" {
+  availability_zone = "us-east-1a"
+  size              = 40
+  type              = "gp3"
+  tags              = { Name = "vol-0data01" }
+}
+
+
+# ============================================================================
+# SCENARIO D4-4: SECURITY AND GOVERNANCE AUDIT BUNDLE
+# ============================================================================
+resource "aws_s3_bucket" "audit_bucket" {
+  bucket        = "techademy-internal-reports-bucket-9812"
+  force_destroy = true
+}
+
+resource "aws_secretsmanager_secret" "db_secret" {
+  name = "db-password-vault"
+}
+
+resource "aws_secretsmanager_secret_version" "db_secret_val" {
+  secret_id     = aws_secretsmanager_secret.db_secret.id
+  secret_string = "InitialExposedPassword123!"
+}
